@@ -1,1 +1,721 @@
+name: Build GIF Cursor APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate project files
+        run: |
+          set -e
+          mkdir -p proj && cd proj
+          mkdir -p "$(dirname app/build.gradle.kts)"
+          cat > app/build.gradle.kts <<'GIFCURSOR_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
 
+          android {
+              namespace = "com.example.gifcursor"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.gifcursor"
+                  minSdk = 28
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          GIFCURSOR_EOF
+
+          mkdir -p "$(dirname app/src/main/AndroidManifest.xml)"
+          cat > app/src/main/AndroidManifest.xml <<'GIFCURSOR_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".CursorService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          GIFCURSOR_EOF
+
+          mkdir -p "$(dirname app/src/main/java/com/example/gifcursor/CursorService.kt)"
+          cat > app/src/main/java/com/example/gifcursor/CursorService.kt <<'GIFCURSOR_EOF'
+          package com.example.gifcursor
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.graphics.Color
+          import android.graphics.ImageDecoder
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.AnimatedImageDrawable
+          import android.graphics.drawable.Drawable
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Choreographer
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewConfiguration
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.FrameLayout
+          import android.widget.ImageView
+          import android.widget.TextView
+          import java.util.Locale
+          import kotlin.math.hypot
+
+          class CursorService : AccessibilityService(), SharedPreferences.OnSharedPreferenceChangeListener {
+              private lateinit var wm: WindowManager
+              private lateinit var prefs: SharedPreferences
+              private val handler = Handler(Looper.getMainLooper())
+              private var rootContainer: FrameLayout? = null
+              private var cursorImageView: ImageView? = null
+              private var fpsTextView: TextView? = null
+
+              private var frameCount = 0
+              private var lastFrameTimeNanos = 0L
+              private var isFpsLoopRunning = false
+
+              private val frameCallback = object : Choreographer.FrameCallback {
+                  override fun doFrame(frameTimeNanos: Long) {
+                      if (!isFpsLoopRunning) return
+                      if (lastFrameTimeNanos > 0) {
+                          frameCount++
+                          val delta = frameTimeNanos - lastFrameTimeNanos
+                          if (delta >= 500_000_000L) {
+                              val fps = frameCount * 1_000_000_000.0 / delta
+                              fpsTextView?.text = String.format(Locale.US, "%.2f FPS", fps)
+                              frameCount = 0
+                              lastFrameTimeNanos = frameTimeNanos
+                          }
+                      } else {
+                          lastFrameTimeNanos = frameTimeNanos
+                      }
+                      Choreographer.getInstance().postFrameCallback(this)
+                  }
+              }
+
+              override fun onServiceConnected() {
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  prefs = getSharedPreferences("cursor", MODE_PRIVATE)
+                  prefs.registerOnSharedPreferenceChangeListener(this)
+                  refresh()
+              }
+
+              override fun onSharedPreferenceChanged(p: SharedPreferences?, key: String?) {
+                  if (key != "x" && key != "y") refresh()
+              }
+
+              private fun refresh() {
+                  hide()
+                  if (prefs.getBoolean("enabled", false)) show()
+              }
+
+              private fun hide() {
+                  stopFpsCounter()
+                  rootContainer?.let { container ->
+                      (cursorImageView?.drawable as? AnimatedImageDrawable)?.stop()
+                      runCatching { wm.removeView(container) }
+                  }
+                  rootContainer = null
+                  cursorImageView = null
+                  fpsTextView = null
+              }
+
+              private fun loadDrawable(): Drawable {
+                  prefs.getString("gif", null)?.let { s ->
+                      try {
+                          return ImageDecoder.decodeDrawable(ImageDecoder.createSource(contentResolver, Uri.parse(s)))
+                      } catch (_: Exception) {
+                      }
+                  }
+                  return GradientDrawable().apply {
+                      shape = GradientDrawable.OVAL
+                      setColor(Color.parseColor("#FF5722"))
+                      setStroke(4, Color.WHITE)
+                  }
+              }
+
+              private fun startFpsCounter() {
+                  if (!isFpsLoopRunning) {
+                      isFpsLoopRunning = true
+                      frameCount = 0
+                      lastFrameTimeNanos = 0L
+                      Choreographer.getInstance().postFrameCallback(frameCallback)
+                  }
+              }
+
+              private fun stopFpsCounter() {
+                  isFpsLoopRunning = false
+                  Choreographer.getInstance().removeFrameCallback(frameCallback)
+              }
+
+              private fun show() {
+                  val density = resources.displayMetrics.density
+                  val cursorSizeDp = prefs.getInt("size", 64)
+                  val cursorSizePx = (cursorSizeDp * density).toInt()
+                  val showFpsMode = prefs.getBoolean("show_fps", false)
+
+                  val container = FrameLayout(this)
+                  
+                  val fpsTv = TextView(this).apply {
+                      text = "144.00 FPS"
+                      setTextColor(Color.BLACK)
+                      textSize = 12f
+                      setPadding((8 * density).toInt(), (4 * density).toInt(), (8 * density).toInt(), (4 * density).toInt())
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor("#C8E6C9"))
+                          cornerRadius = 12 * density
+                      }
+                      visibility = if (showFpsMode) View.VISIBLE else View.GONE
+                  }
+                  val fpsLayoutParams = FrameLayout.LayoutParams(
+                      FrameLayout.LayoutParams.WRAP_CONTENT,
+                      FrameLayout.LayoutParams.WRAP_CONTENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                      bottomMargin = (4 * density).toInt()
+                  }
+                  container.addView(fpsTv, fpsLayoutParams)
+
+                  val imgView = ImageView(this).apply {
+                      scaleType = ImageView.ScaleType.FIT_CENTER
+                      setImageDrawable(loadDrawable())
+                      alpha = prefs.getInt("alpha", 100) / 100f
+                  }
+                  val imgLayoutParams = FrameLayout.LayoutParams(cursorSizePx, cursorSizePx).apply {
+                      gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                  }
+                  container.addView(imgView, imgLayoutParams)
+
+                  val windowWidth = maxOf(cursorSizePx, (120 * density).toInt())
+                  val windowHeight = cursorSizePx + (30 * density).toInt()
+
+                  val p = WindowManager.LayoutParams(
+                      windowWidth, windowHeight,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  p.gravity = Gravity.TOP or Gravity.START
+                  p.x = prefs.getInt("x", 200)
+                  p.y = prefs.getInt("y", 400)
+                  p.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+
+                  var downX = 0f
+                  var downY = 0f
+                  var startX = 0
+                  var startY = 0
+                  var moved = false
+                  val slop = ViewConfiguration.get(this).scaledTouchSlop
+
+                  container.setOnTouchListener { _, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              downX = e.rawX; downY = e.rawY
+                              startX = p.x; startY = p.y
+                              moved = false
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val mx = e.rawX - downX
+                              val my = e.rawY - downY
+                              if (!moved && hypot(mx, my) > slop) moved = true
+                              if (moved) {
+                                  p.x = startX + mx.toInt()
+                                  p.y = startY + my.toInt()
+                                  wm.updateViewLayout(container, p)
+                              }
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (moved) {
+                                  prefs.edit().putInt("x", p.x).putInt("y", p.y).apply()
+                              } else {
+                                  if (prefs.getBoolean("show_fps", false)) {
+                                      fpsTv.visibility = View.VISIBLE
+                                      startFpsCounter()
+                                  }
+                                  tap(container, p)
+                              }
+                          }
+                      }
+                      true
+                  }
+
+                  wm.addView(container, p)
+                  (imgView.drawable as? AnimatedImageDrawable)?.apply {
+                      repeatCount = AnimatedImageDrawable.REPEAT_INFINITE
+                      start()
+                  }
+
+                  rootContainer = container
+                  cursorImageView = imgView
+                  fpsTextView = fpsTv
+
+                  if (showFpsMode) {
+                      startFpsCounter()
+                  }
+              }
+
+              private fun tap(v: View, p: WindowManager.LayoutParams) {
+                  val x = (p.x + (p.width / 2) + prefs.getInt("offx", 0)).toFloat()
+                  val y = (p.y + (p.height / 2) + prefs.getInt("offy", 0)).toFloat()
+                  setTouchable(v, p, false)
+                  handler.postDelayed({
+                      val path = Path().apply { moveTo(x, y) }
+                      val gesture = GestureDescription.Builder()
+                          .addStroke(GestureDescription.StrokeDescription(path, 0, 50))
+                          .build()
+                      val sent = dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
+                          override fun onCompleted(g: GestureDescription?) = setTouchable(v, p, true)
+                          override fun onCancelled(g: GestureDescription?) = setTouchable(v, p, true)
+                      }, null)
+                      if (!sent) setTouchable(v, p, true)
+                  }, 80)
+              }
+
+              private fun setTouchable(v: View, p: WindowManager.LayoutParams, on: Boolean) {
+                  if (v !== rootContainer) return
+                  p.flags = if (on) p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                  else p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                  wm.updateViewLayout(v, p)
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  if (::prefs.isInitialized) prefs.unregisterOnSharedPreferenceChangeListener(this)
+                  if (::wm.isInitialized) hide()
+                  super.onDestroy()
+              }
+          }
+          GIFCURSOR_EOF
+
+          mkdir -p "$(dirname app/src/main/java/com/example/gifcursor/MainActivity.kt)"
+          cat > app/src/main/java/com/example/gifcursor/MainActivity.kt <<'GIFCURSOR_EOF'
+          package com.example.gifcursor
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.graphics.Color
+          import android.graphics.ImageDecoder
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var prefs: SharedPreferences
+              private val pickGif = 1
+              private val pickAppIcon = 2
+              private var headerIconView: ImageView? = null
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  prefs = getSharedPreferences("cursor", MODE_PRIVATE)
+
+                  val density = resources.displayMetrics.density
+
+                  val rootLayout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#B388FF"))
+                      setPadding((16 * density).toInt(), (24 * density).toInt(), (16 * density).toInt(), (24 * density).toInt())
+                      layoutParams = ViewGroup.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.MATCH_PARENT
+                      )
+                  }
+
+                  val headerLayout = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      setPadding((12 * density).toInt(), (12 * density).toInt(), (12 * density).toInt(), (12 * density).toInt())
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor("#9965F4"))
+                          setStroke((3 * density).toInt(), Color.parseColor("#FF4081"))
+                          cornerRadius = 12 * density
+                      }
+                  }
+
+                  headerIconView = ImageView(this).apply {
+                      val iconSize = (36 * density).toInt()
+                      layoutParams = LinearLayout.LayoutParams(iconSize, iconSize).apply {
+                          rightMargin = (12 * density).toInt()
+                      }
+                      updateAppHeaderIcon(this)
+                      setOnClickListener { pickAppIconImage() }
+                  }
+                  headerLayout.addView(headerIconView)
+
+                  val titleBox = TextView(this).apply {
+                      text = "GIF CURSOR"
+                      setTextColor(Color.WHITE)
+                      textSize = 20f
+                      setTypeface(null, Typeface.BOLD)
+                      gravity = Gravity.CENTER
+                  }
+                  headerLayout.addView(titleBox)
+
+                  val titleParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      bottomMargin = (16 * density).toInt()
+                  }
+                  rootLayout.addView(headerLayout, titleParams)
+
+                  val btnAccessibility = TextView(this).apply {
+                      text = "1. ENABLE ACCESSIBILITY SERVICE"
+                      setTextColor(Color.WHITE)
+                      textSize = 15f
+                      setTypeface(null, Typeface.BOLD)
+                      gravity = Gravity.CENTER
+                      setPadding(0, (16 * density).toInt(), 0, (16 * density).toInt())
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor("#FFA7A6"))
+                          cornerRadius = 12 * density
+                      }
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  }
+                  val btn1Params = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      bottomMargin = (12 * density).toInt()
+                  }
+                  rootLayout.addView(btnAccessibility, btn1Params)
+
+                  val btnCustomSkin = TextView(this).apply {
+                      text = "open custom skin"
+                      setTextColor(Color.WHITE)
+                      textSize = 18f
+                      setTypeface(null, Typeface.BOLD)
+                      gravity = Gravity.CENTER
+                      setPadding(0, (16 * density).toInt(), 0, (16 * density).toInt())
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor("#FFA7A6"))
+                          cornerRadius = 12 * density
+                      }
+                      setOnClickListener {
+                          val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                              addCategory(Intent.CATEGORY_OPENABLE)
+                              type = "image/*"
+                          }
+                          startActivityForResult(i, pickGif)
+                      }
+                  }
+                  val btn2Params = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      bottomMargin = (16 * density).toInt()
+                  }
+                  rootLayout.addView(btnCustomSkin, btn2Params)
+
+                  val row1 = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      weightSum = 2f
+                  }
+
+                  val btnShowCursor = createGridToggleButton("show cursor", "enabled", false)
+                  val btnCustomEmote = createGridButton("custom emote") {
+                      Toast.makeText(this, "Custom emote selected", Toast.LENGTH_SHORT).show()
+                  }
+
+                  row1.addView(btnShowCursor, LinearLayout.LayoutParams(0, (48 * density).toInt(), 1f).apply { rightMargin = (8 * density).toInt() })
+                  row1.addView(btnCustomEmote, LinearLayout.LayoutParams(0, (48 * density).toInt(), 1f).apply { leftMargin = (8 * density).toInt() })
+
+                  val row1Params = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      bottomMargin = (12 * density).toInt()
+                  }
+                  rootLayout.addView(row1, row1Params)
+
+                  val row2 = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      weightSum = 2f
+                  }
+
+                  val btnShowFps = createGridToggleButton("show fps", "show_fps", false)
+                  val btnSupport = createGridButton("support") {
+                      Toast.makeText(this, "Support option clicked", Toast.LENGTH_SHORT).show()
+                  }
+
+                  row2.addView(btnShowFps, LinearLayout.LayoutParams(0, (48 * density).toInt(), 1f).apply { rightMargin = (8 * density).toInt() })
+                  row2.addView(btnSupport, LinearLayout.LayoutParams(0, (48 * density).toInt(), 1f).apply { leftMargin = (8 * density).toInt() })
+
+                  val row2Params = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      bottomMargin = (12 * density).toInt()
+                  }
+                  rootLayout.addView(row2, row2Params)
+
+                  val row3 = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      weightSum = 2f
+                  }
+
+                  val btnCustomAppImg = createGridButton("custom app image") { pickAppIconImage() }
+                  val btnMore = createGridButton("more") {
+                      Toast.makeText(this, "More features & settings", Toast.LENGTH_SHORT).show()
+                  }
+
+                  row3.addView(btnCustomAppImg, LinearLayout.LayoutParams(0, (48 * density).toInt(), 1f).apply { rightMargin = (8 * density).toInt() })
+                  row3.addView(btnMore, LinearLayout.LayoutParams(0, (48 * density).toInt(), 1f).apply { leftMargin = (8 * density).toInt() })
+
+                  val row3Params = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      bottomMargin = (20 * density).toInt()
+                  }
+                  rootLayout.addView(row3, row3Params)
+
+                  sliderCard(rootLayout, "SIZE", "size", 64, 24, 200)
+                  sliderCard(rootLayout, "Opacity", "alpha", 100, 20, 100)
+                  sliderCard(rootLayout, "speed", "speed", 89, 1, 100)
+
+                  val scrollView = ScrollView(this).apply {
+                      addView(rootLayout)
+                      isFillViewport = true
+                  }
+                  setContentView(scrollView)
+              }
+
+              private fun pickAppIconImage() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                      addCategory(Intent.CATEGORY_OPENABLE)
+                      type = "image/*"
+                  }
+                  startActivityForResult(i, pickAppIcon)
+              }
+
+              private fun updateAppHeaderIcon(imageView: ImageView) {
+                  val savedIcon = prefs.getString("custom_app_icon", null)
+                  if (savedIcon != null) {
+                      try {
+                          val drawable = ImageDecoder.decodeDrawable(ImageDecoder.createSource(contentResolver, Uri.parse(savedIcon)))
+                          imageView.setImageDrawable(drawable)
+                          return
+                      } catch (_: Exception) {}
+                  }
+                  val density = resources.displayMetrics.density
+                  imageView.setImageDrawable(GradientDrawable().apply {
+                      shape = GradientDrawable.OVAL
+                      setColor(Color.WHITE)
+                      setStroke((2 * density).toInt(), Color.parseColor("#FF4081"))
+                  })
+              }
+
+              private fun createGridButton(label: String, onClick: () -> Unit): TextView {
+                  val density = resources.displayMetrics.density
+                  return TextView(this).apply {
+                      text = label
+                      setTextColor(Color.BLACK)
+                      textSize = 14f
+                      setTypeface(null, Typeface.BOLD)
+                      gravity = Gravity.CENTER
+                      background = GradientDrawable().apply {
+                          setColor(Color.WHITE)
+                          cornerRadius = 10 * density
+                      }
+                      setOnClickListener { onClick() }
+                  }
+              }
+
+              private fun createGridToggleButton(label: String, key: String, defaultVal: Boolean): TextView {
+                  val density = resources.displayMetrics.density
+                  var active = prefs.getBoolean(key, defaultVal)
+
+                  fun updateBg(tv: TextView, isAct: Boolean) {
+                      tv.background = GradientDrawable().apply {
+                          setColor(if (isAct) Color.parseColor("#DCEDC8") else Color.WHITE)
+                          cornerRadius = 10 * density
+                          if (isAct) setStroke((2 * density).toInt(), Color.parseColor("#7CB342"))
+                      }
+                  }
+
+                  return TextView(this).apply {
+                      text = label
+                      setTextColor(Color.BLACK)
+                      textSize = 14f
+                      setTypeface(null, Typeface.BOLD)
+                      gravity = Gravity.CENTER
+                      updateBg(this, active)
+                      setOnClickListener {
+                          active = !active
+                          prefs.edit().putBoolean(key, active).apply()
+                          updateBg(this, active)
+                      }
+                  }
+              }
+
+              private fun sliderCard(root: LinearLayout, label: String, key: String, def: Int, min: Int, max: Int) {
+                  val density = resources.displayMetrics.density
+                  val card = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding((16 * density).toInt(), (12 * density).toInt(), (16 * density).toInt(), (12 * density).toInt())
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor("#9575CD"))
+                          cornerRadius = 12 * density
+                      }
+                  }
+
+                  val topRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                  }
+
+                  val titleTv = TextView(this).apply {
+                      text = label
+                      setTextColor(Color.WHITE)
+                      textSize = 16f
+                      setTypeface(null, Typeface.BOLD)
+                  }
+
+                  val currentVal = prefs.getInt(key, def)
+                  val percentTv = TextView(this).apply {
+                      text = "$currentVal%"
+                      setTextColor(Color.WHITE)
+                      textSize = 16f
+                      setTypeface(null, Typeface.BOLD)
+                      gravity = Gravity.END
+                  }
+
+                  topRow.addView(titleTv, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  topRow.addView(percentTv, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+                  val seekBar = SeekBar(this).apply {
+                      this.max = max - min
+                      this.progress = currentVal - min
+                      thumb = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(Color.parseColor("#FFE082"))
+                          setSize((20 * density).toInt(), (20 * density).toInt())
+                      }
+                  }
+
+                  seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                          val valPct = p + min
+                          percentTv.text = "$valPct%"
+                      }
+                      override fun onStartTrackingTouch(sb: SeekBar?) {}
+                      override fun onStopTrackingTouch(sb: SeekBar?) {
+                          prefs.edit().putInt(key, (sb?.progress ?: 0) + min).apply()
+                      }
+                  })
+
+                  card.addView(topRow)
+                  card.addView(seekBar, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      topMargin = (8 * density).toInt()
+                  })
+
+                  val cardParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      bottomMargin = (12 * density).toInt()
+                  }
+                  root.addView(card, cardParams)
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  val uri = data?.data
+                  if (resultCode == RESULT_OK && uri != null) {
+                      contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                      if (requestCode == pickGif) {
+                          prefs.edit().putString("gif", uri.toString()).apply()
+                          Toast.makeText(this, "Skin updated!", Toast.LENGTH_SHORT).show()
+                      } else if (requestCode == pickAppIcon) {
+                          prefs.edit().putString("custom_app_icon", uri.toString()).apply()
+                          headerIconView?.let { updateAppHeaderIcon(it) }
+                          Toast.makeText(this, "App icon updated!", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+              }
+          }
+          GIFCURSOR_EOF
+
+          mkdir -p "$(dirname app/src/main/res/values/strings.xml)"
+          cat > app/src/main/res/values/strings.xml <<'GIFCURSOR_EOF'
+          <resources>
+              <string name="app_name">GIF Cursor</string>
+              <string name="service_desc">Shows a GIF cursor overlay and forwards taps made on it to the app underneath.</string>
+          </resources>
+          GIFCURSOR_EOF
+
+          mkdir -p "$(dirname app/src/main/res/xml/accessibility_config.xml)"
+          cat > app/src/main/res/xml/accessibility_config.xml <<'GIFCURSOR_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          GIFCURSOR_EOF
+
+          mkdir -p "$(dirname build.gradle.kts)"
+          cat > build.gradle.kts <<'GIFCURSOR_EOF'
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          GIFCURSOR_EOF
+
+          mkdir -p "$(dirname gradle.properties)"
+          cat > gradle.properties <<'GIFCURSOR_EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=false
+          GIFCURSOR_EOF
+
+          mkdir -p "$(dirname settings.gradle.kts)"
+          cat > settings.gradle.kts <<'GIFCURSOR_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "GifCursor"
+          include(":app")
+          GIFCURSOR_EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
+      - name: Build debug APK
+        working-directory: proj
+        run: gradle --no-daemon assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gif-cursor-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
